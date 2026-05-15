@@ -520,26 +520,12 @@ function excCriarTempCPF($conn, string $bdOrigem, string $bdDestino, string $cod
         executarSQL($conn, $sql, "EXC: coletar CPF $campo (mttbcon)");
     }
 
-    $camposHis = ['AD1_CGCCPF', 'AD2_CPF', 'AD3_CPF', 'AD4_CPF'];
-    $colsHis = listarColunasOrigem($conn, $bdOrigem, 'mttbhis');
-    if (!empty($colsHis)) {
-        $totalHis = count(array_intersect($camposHis, $colsHis));
-        $j = 0;
-        foreach ($camposHis as $campo) {
-            if (!in_array($campo, $colsHis)) continue;
-            $j++;
-            logInfo("  CPF $j/$totalHis: coletando $campo de mttbhis (CODEMP IN ($codempList))...");
-            $sql = "INSERT INTO [$bdDestino].DBO._exc_temp_cpf
-                    SELECT DISTINCT h.[$campo] FROM [$bdOrigem].DBO.mttbhis h
-                    WHERE h.[$campo] IS NOT NULL
-                      AND h.CODEMP IN ($codempList)
-                      AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
-                                  WHERE X.CODEMP IN ($codempList)
-                                    AND X.CODEMP = h.CODEMP AND X.REGIAO = h.REGIAO
-                                    AND X.NUCLEO = h.NUCLEO AND X.CONTRATO = h.CONTRATO)";
-            executarSQL($conn, $sql, "EXC: coletar CPF $campo (mttbhis)");
-        }
-    }
+    // NOTA: mttbhis (historico de adquirentes) NAO e usado no reprocessamento
+    // de excecoes. mttbhis traz CPFs de TODOS que ja passaram pelos contratos
+    // ao longo do tempo (cessoes, novacoes, conjuges historicos), inflando a
+    // mttbse1 com fichas que nao correspondem aos adquirentes vigentes.
+    // O escopo do reprocessamento e: CPFs vigentes em mttbcon dos contratos
+    // presentes na CON_FIDC.
 
     logInfo("  CPF: normalizando para CHAR(14)...");
     executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._exc_temp_cpf_final (cpf CHAR(14))", "EXC: criar _exc_temp_cpf_final");
