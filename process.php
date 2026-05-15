@@ -509,25 +509,44 @@ if ($onlyFinalizers || $onlyExceptions) {
         exit;
     }
 
-    // Reconstroi codempList lendo CON_FIDC existente (necessario pra fases que filtram por codemp)
+    // Lista bruta de codemps presentes na CON_FIDC
+    $codempsCon = [];
     $stmtCe = sqlsrv_query($conn, "SELECT DISTINCT CODEMP FROM [$bdDestino].DBO.CON_FIDC ORDER BY CODEMP");
     if ($stmtCe) {
         while ($r = sqlsrv_fetch_array($stmtCe, SQLSRV_FETCH_ASSOC)) {
-            $codemps[] = (int)$r['CODEMP'];
+            $codempsCon[] = (int)$r['CODEMP'];
         }
         sqlsrv_free_stmt($stmtCe);
     }
-    if (empty($codemps)) {
+
+    if (empty($codempsCon)) {
         if ($onlyExceptions) {
-            logError("CON_FIDC vazia em [$bdDestino]. Sem contratos, nao ha como reprocessar exceptions.");
+            logError("CON_FIDC vazia em [$bdDestino]. Sem contratos, nao ha como reprocessar excecoes.");
             sendEvent('done', ['success' => false]);
             exit;
         }
         logWarn("CON_FIDC vazia ou inexistente; finalizadores nao usam codemp diretamente, mas alguns helpers podem precisar.");
+        $codemps = [];
     } else {
+        // Se o usuario informou CODEMP no formulario, restringe ao(s) informado(s)
+        if ($onlyExceptions && !empty($codempsForm)) {
+            $codemps = array_values(array_intersect($codempsForm, $codempsCon));
+            $ignorados = array_values(array_diff($codempsForm, $codempsCon));
+            if (empty($codemps)) {
+                logError("Nenhuma das empresas informadas (" . implode(',', $codempsForm) . ") existe em CON_FIDC. Codemps presentes: " . implode(',', $codempsCon) . ".");
+                sendEvent('done', ['success' => false]);
+                exit;
+            }
+            if (!empty($ignorados)) {
+                logWarn("Empresas informadas mas ausentes em CON_FIDC (ignoradas): " . implode(',', $ignorados));
+            }
+            logSuccess("Modo $rotuloModo: restringindo a CODEMP(s) do formulario: " . implode(',', $codemps));
+        } else {
+            $codemps = $codempsCon;
+            logSuccess("Modo $rotuloModo: $bdDestino existe, codemps em CON_FIDC: " . implode(',', $codemps));
+        }
         $codempList = implode(',', $codemps);
         $codempPrimeiro = $codemps[0];
-        logSuccess("Modo $rotuloModo: $bdDestino existe, codemps em CON_FIDC: $codempList");
     }
     $currentStep += 2; // pular os steps de "Criando CON_FIDC" e "CON_FIDC populada"
     sendProgress($currentStep, $totalSteps, "Modo $rotuloModo: ambiente validado");
@@ -982,6 +1001,69 @@ function sghCriarTempCodAdq($conn, string $bdOrigem, string $bdDestino): bool
 }
 
 /**
+ * Variante de sghCriarTempCPF que restringe a coleta aos contratos
+ * das empresas indicadas em $codempList. Usada pelo reprocessamento
+ * de excecoes para evitar puxar CPFs de empresas que nao serao recriadas.
+ */
+function sghCriarTempCPFFiltradoPorCodemp($conn, string $bdOrigem, string $bdDestino, string $codempList): bool
+{
+    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf");
+    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
+
+    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_cpf (cpf CHAR(14))", "SGH: criar _sgh_temp_cpf")) {
+        return false;
+    }
+
+    $camposCon = ['ADQ1_CPFCGC', 'ADQ2_CPF', 'ADQ3_CPF', 'ADQ4_CPF', 'DATU_CGC_CPF', 'DATU_AD2_CPF', 'DATU_AD3_CPF', 'DATU_AD4_CPF'];
+    $colsCon = getTableColumns($conn, $bdOrigem, 'mttbcon');
+    $totalCon = count(array_intersect($camposCon, $colsCon));
+    $i = 0;
+    foreach ($camposCon as $campo) {
+        if (!in_array($campo, $colsCon)) continue;
+        $i++;
+        logInfo("  CPF $i/$totalCon: coletando $campo de mttbcon (CODEMP IN ($codempList))...");
+        $sql = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf
+                SELECT DISTINCT c.[$campo] FROM [$bdOrigem].DBO.mttbcon c
+                WHERE c.[$campo] IS NOT NULL
+                  AND c.CODEMP IN ($codempList)
+                  AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
+                              WHERE X.CODEMP IN ($codempList)
+                                AND X.CODEMP = c.CODEMP AND X.REGIAO = c.REGIAO
+                                AND X.NUCLEO = c.NUCLEO AND X.CONTRATO = c.CONTRATO)";
+        executarSQL($conn, $sql, "SGH: coletar CPF $campo (mttbcon)");
+    }
+
+    $camposHis = ['AD1_CGCCPF', 'AD2_CPF', 'AD3_CPF', 'AD4_CPF'];
+    $colsHis = getTableColumns($conn, $bdOrigem, 'mttbhis');
+    if (!empty($colsHis)) {
+        $totalHis = count(array_intersect($camposHis, $colsHis));
+        $j = 0;
+        foreach ($camposHis as $campo) {
+            if (!in_array($campo, $colsHis)) continue;
+            $j++;
+            logInfo("  CPF $j/$totalHis: coletando $campo de mttbhis (CODEMP IN ($codempList))...");
+            $sql = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf
+                    SELECT DISTINCT h.[$campo] FROM [$bdOrigem].DBO.mttbhis h
+                    WHERE h.[$campo] IS NOT NULL
+                      AND h.CODEMP IN ($codempList)
+                      AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
+                                  WHERE X.CODEMP IN ($codempList)
+                                    AND X.CODEMP = h.CODEMP AND X.REGIAO = h.REGIAO
+                                    AND X.NUCLEO = h.NUCLEO AND X.CONTRATO = h.CONTRATO)";
+            executarSQL($conn, $sql, "SGH: coletar CPF $campo (mttbhis)");
+        }
+    }
+
+    logInfo("  CPF: normalizando para CHAR(14)...");
+    executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_cpf_final (cpf CHAR(14))", "SGH: criar _sgh_temp_cpf_final");
+    $sqlNorm = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf_final
+                SELECT DISTINCT RIGHT('00000000000000' + LTRIM(RTRIM(t.cpf)), 14)
+                FROM [$bdDestino].DBO._sgh_temp_cpf t
+                WHERE t.cpf IS NOT NULL AND LTRIM(RTRIM(t.cpf)) <> ''";
+    return executarSQL($conn, $sqlNorm, "SGH: normalizar CPFs");
+}
+
+/**
  * Reprocessa apenas as 3 tabelas de excecao (mttbse1, mttbdep, mttbse2)
  * no modo SGH, apagando e recriando-as no banco destino.
  * Resolve CLIENTE_UNIC via mttbse2.CGC_CPF -> CLIENTE_UNIC (sem depender
@@ -1009,14 +1091,14 @@ function sghReprocessarExcecoes($conn, string $bdOrigem, string $bdDestino, stri
     dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
     dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cliente_unic");
 
-    // 2) Coletar CPFs (reusa o helper ja existente)
-    if (!sghCriarTempCPF($conn, $bdOrigem, $bdDestino)) {
+    // 2) Coletar CPFs filtrados pelos contratos das empresas-alvo
+    if (!sghCriarTempCPFFiltradoPorCodemp($conn, $bdOrigem, $bdDestino, $codempList)) {
         return false;
     }
     $cntCpf = contarRegistros($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
-    logSuccess("CPFs distintos coletados: $cntCpf");
+    logSuccess("CPFs distintos coletados (apenas CODEMP IN ($codempList)): $cntCpf");
 
-    // 3) Resolver CLIENTE_UNIC via mttbse2 (CGC_CPF + CLIENTE_UNIC)
+    // 3) Resolver CLIENTE_UNIC via mttbse2 (CGC_CPF + CLIENTE_UNIC), restrito a CODEMP alvo
     if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_cliente_unic (cliente_unic BIGINT)",
                      "SGH: criar _sgh_temp_cliente_unic")) {
         return false;
@@ -1025,7 +1107,8 @@ function sghReprocessarExcecoes($conn, string $bdOrigem, string $bdDestino, stri
                    SELECT DISTINCT s.CLIENTE_UNIC
                      FROM [$bdOrigem].DBO.mttbse2 s
                     INNER JOIN [$bdDestino].DBO._sgh_temp_cpf_final t ON t.cpf = s.CGC_CPF
-                    WHERE s.CLIENTE_UNIC IS NOT NULL AND s.CLIENTE_UNIC <> 0";
+                    WHERE s.CODEMP IN ($codempList)
+                      AND s.CLIENTE_UNIC IS NOT NULL AND s.CLIENTE_UNIC <> 0";
     if (!executarSQL($conn, $sqlResolve, "SGH: resolver CLIENTE_UNIC via mttbse2")) return false;
     $cntCli = contarRegistros($conn, "[$bdDestino].DBO._sgh_temp_cliente_unic");
     logSuccess("CLIENTE_UNIC resolvidos: $cntCli");
