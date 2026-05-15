@@ -89,6 +89,7 @@ $bdDestino     = trim($_POST['bd_destino'] ?? '');
 $dropDestino   = ($_POST['drop_destino'] ?? '0') === '1';
 $skipBlobs     = ($_POST['skip_blobs']   ?? '0') === '1';
 $onlyFinalizers = ($_POST['only_finalizers'] ?? '0') === '1';
+$onlyExceptions = ($_POST['only_exceptions'] ?? '0') === '1';
 $tipo          = trim($_POST['tipo'] ?? 'cliente');
 
 // Parse do(s) codigo(s) de empresa: aceita "5" ou "2,5,11,12,21,22,25"
@@ -113,6 +114,24 @@ if ($onlyFinalizers && $tipo !== 'sgh') {
     exit;
 }
 
+if ($onlyExceptions && $tipo !== 'cliente') {
+    logError("Modo REPROCESSAR EXCECOES so esta disponivel no modo Cliente.");
+    sendEvent('done', ['success' => false]);
+    exit;
+}
+
+if ($onlyExceptions && $onlyFinalizers) {
+    logError("Nao e possivel combinar REPROCESSAR EXCECOES com Modo RETOMADA.");
+    sendEvent('done', ['success' => false]);
+    exit;
+}
+
+if ($onlyExceptions && $dropDestino) {
+    logError("REPROCESSAR EXCECOES nao pode ser combinado com APAGAR E RECRIAR banco destino (o banco precisa existir).");
+    sendEvent('done', ['success' => false]);
+    exit;
+}
+
 if (!$servidor || !$login || !$bdOrigem || !$bdDestino) {
     logError('Parametros obrigatorios nao informados (servidor/login/bancos).');
     sendEvent('done', ['success' => false]);
@@ -127,6 +146,9 @@ $codempPrimeiro = 0;
 
 if ($onlyFinalizers) {
     logWarn("Modo RETOMADA: pulando leitura/validacao do arquivo TXT.");
+    // codempList sera reconstruido a partir da CON_FIDC ja existente apos conectar
+} elseif ($onlyExceptions) {
+    logWarn("Modo REPROCESSAR EXCECOES: pulando leitura/validacao do arquivo TXT.");
     // codempList sera reconstruido a partir da CON_FIDC ja existente apos conectar
 } else {
 
@@ -299,7 +321,7 @@ if (!empty($contratos)) {
     logInfo("Primeira linha: CODEMP=[{$c['codemp']}] REGIAO=[{$c['regiao']}] NUCLEO=[{$c['nucleo']}] CONTRATO=[{$c['contrato']}]");
 }
 
-} // fim if (!$onlyFinalizers) - leitura do TXT
+} // fim if (!$onlyFinalizers && !$onlyExceptions) - leitura do TXT
 
 // ===================== CONEXAO SQL SERVER =====================
 logInfo("Conectando ao SQL Server: $servidor ...");
@@ -437,6 +459,139 @@ function substituirPlaceholders(string $sql, string $orig, string $dest, string 
     return $sql;
 }
 
+/**
+ * Reprocessa as 3 tabelas de excecao do modo Cliente (SE1/DEP/SE2),
+ * apagando e recriando-as no banco destino. Usa link via CPF (mttbcon/mttbhis)
+ * e resolve CLIENTE_UNIC consultando mttbse2 do banco origem.
+ * Pressupoe que [DEST].DBO.CON_FIDC ja existe e esta populada.
+ */
+function reprocessarExcecoes($conn, string $bdOrigem, string $bdDestino, string $codempList): bool
+{
+    logInfo("");
+    logInfo("========================================");
+    logInfo("REPROCESSAR EXCECOES: SE1, DEP, SE2");
+    logInfo("========================================");
+
+    if ($codempList === '') {
+        logError("codempList vazio: nao e possivel filtrar exceptions por empresa.");
+        return false;
+    }
+
+    // 1) Apagar as 3 tabelas destino e quaisquer temps remanescentes
+    logInfo("Apagando tabelas de excecao existentes (se houver)...");
+    dropIfExists($conn, "[$bdDestino].DBO.ficha_socio_economica");
+    dropIfExists($conn, "[$bdDestino].DBO.DEPENDENTES_CLIENTE");
+    dropIfExists($conn, "[$bdDestino].DBO.CADASTRO_INSCRICOES");
+    dropIfExists($conn, "[$bdDestino].DBO._temp_cpf");
+    dropIfExists($conn, "[$bdDestino].DBO._temp_cpf_final");
+    dropIfExists($conn, "[$bdDestino].DBO._temp_cliente_unic");
+    logSuccess("Tabelas alvo limpas.");
+
+    // 2) Coletar CPFs dos contratos presentes em CON_FIDC
+    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._temp_cpf (cpf VARCHAR(20))", 'Criar _temp_cpf')) {
+        return false;
+    }
+
+    // Helper: monta INSERT padrao filtrando pelos contratos em CON_FIDC
+    $inserirCpf = function (string $expr, string $tabela, string $alias, string $rotulo) use ($conn, $bdOrigem, $bdDestino) {
+        $sql = "INSERT INTO [$bdDestino].DBO._temp_cpf
+                SELECT DISTINCT $alias.$expr
+                  FROM [$bdOrigem].DBO.$tabela $alias
+                 WHERE EXISTS (
+                       SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
+                        WHERE X.CODEMP   = $alias.CODEMP
+                          AND X.REGIAO   = $alias.REGIAO
+                          AND X.NUCLEO   = $alias.NUCLEO
+                          AND X.CONTRATO = $alias.CONTRATO
+                 )";
+        return executarSQL($conn, $sql, "Coletar CPFs $rotulo");
+    };
+
+    // mttbcon: 4 adquirentes + DATU (cgc + 3 adicionais)
+    if (!$inserirCpf('ADQ1_CPFCGC',  'mttbcon', 'c', 'ADQ1 (mttbcon)')) return false;
+    if (!$inserirCpf('ADQ2_CPF',     'mttbcon', 'c', 'ADQ2 (mttbcon)')) return false;
+    if (!$inserirCpf('ADQ3_CPF',     'mttbcon', 'c', 'ADQ3 (mttbcon)')) return false;
+    if (!$inserirCpf('ADQ4_CPF',     'mttbcon', 'c', 'ADQ4 (mttbcon)')) return false;
+    if (!$inserirCpf('DATU_CGC_CPF', 'mttbcon', 'c', 'DATU_CGC_CPF (mttbcon)')) return false;
+    if (!$inserirCpf('DATU_AD2_CPF', 'mttbcon', 'c', 'DATU_AD2 (mttbcon)')) return false;
+    if (!$inserirCpf('DATU_AD3_CPF', 'mttbcon', 'c', 'DATU_AD3 (mttbcon)')) return false;
+    if (!$inserirCpf('DATU_AD4_CPF', 'mttbcon', 'c', 'DATU_AD4 (mttbcon)')) return false;
+    // mttbhis: historico de adquirentes
+    if (!$inserirCpf('AD1_CGCCPF',   'mttbhis', 'h', 'AD1 (mttbhis)')) return false;
+    if (!$inserirCpf('AD2_CPF',      'mttbhis', 'h', 'AD2 (mttbhis)')) return false;
+    if (!$inserirCpf('AD3_CPF',      'mttbhis', 'h', 'AD3 (mttbhis)')) return false;
+    if (!$inserirCpf('AD4_CPF',      'mttbhis', 'h', 'AD4 (mttbhis)')) return false;
+
+    // 3) Normalizar a 14 caracteres
+    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._temp_cpf_final (cpf CHAR(14))", 'Criar _temp_cpf_final')) return false;
+    $sqlNorm = "INSERT INTO [$bdDestino].DBO._temp_cpf_final
+                SELECT DISTINCT RIGHT('00000000000000' + LTRIM(RTRIM(t.cpf)), 14)
+                  FROM [$bdDestino].DBO._temp_cpf t
+                 WHERE t.cpf IS NOT NULL AND LTRIM(RTRIM(t.cpf)) <> ''";
+    if (!executarSQL($conn, $sqlNorm, 'Normalizar CPFs')) return false;
+
+    $cntCpf = contarRegistros($conn, "[$bdDestino].DBO._temp_cpf_final");
+    logSuccess("CPFs distintos coletados: $cntCpf");
+
+    // 4) Resolver CLIENTE_UNIC via mttbse2 (que tem CGC_CPF + CLIENTE_UNIC)
+    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._temp_cliente_unic (cliente_unic BIGINT)", 'Criar _temp_cliente_unic')) {
+        return false;
+    }
+    $sqlResolve = "INSERT INTO [$bdDestino].DBO._temp_cliente_unic
+                   SELECT DISTINCT s.CLIENTE_UNIC
+                     FROM [$bdOrigem].DBO.mttbse2 s
+                    INNER JOIN [$bdDestino].DBO._temp_cpf_final t ON t.cpf = s.CGC_CPF
+                    WHERE s.CLIENTE_UNIC IS NOT NULL AND s.CLIENTE_UNIC <> 0";
+    if (!executarSQL($conn, $sqlResolve, 'Resolver CLIENTE_UNIC via mttbse2')) return false;
+
+    $cntCli = contarRegistros($conn, "[$bdDestino].DBO._temp_cliente_unic");
+    logSuccess("CLIENTE_UNIC resolvidos: $cntCli");
+
+    // 5) SE1 - Ficha Socioeconomica (link por CPF)
+    $sqlSE1 = "SELECT s.CODEMP, s.CGCCPF, s.FISJUR, s.NOMTIT, s.END_TITC, s.CPL_ENDC,
+                      s.BAIRROC, s.CIDADEC, s.ESTADOC, s.COD_CEPC, s.CPL_CEPC, s.CXA_POSC,
+                      s.DDD_TELC, s.NUM_TELC, s.RAM_TELC, s.DDD_FAXC, s.NUM_FAXC,
+                      s.CODNAC, s.CODNAT, s.CODSEX, s.ESTCIV, s.REGCAS, s.DTANAS, s.ATVPRO,
+                      s.NUMIDT, s.ORGIDT, s.ESTIDT, s.FXA_REND, s.CNJNOM, s.CNJCPF,
+                      s.CODUSR, s.DTAIMP, s.DTAMOV, s.EMISS_CONJUG, s.CODAGENTE, s.EMAIL,
+                      s.PIS, s.PIS_CONJ, s.CONS_ORGAO, s.CONS_SETOR, s.CONS_MUNIC, s.CONS_MATR,
+                      s.LCOB_BANCO, s.LCOB_AGENCIA, s.LCOB_CONTA, s.LCOB_TIPO_CC
+                 INTO [$bdDestino].DBO.ficha_socio_economica
+                 FROM [$bdOrigem].DBO.mttbse1 s
+                INNER JOIN [$bdDestino].DBO._temp_cpf_final t ON t.cpf = s.CGCCPF
+                WHERE s.CODEMP IN ($codempList)";
+    if (!executarSQL($conn, $sqlSE1, 'Recriar ficha_socio_economica (SE1)')) return false;
+    $cSE1 = contarRegistros($conn, "[$bdDestino].DBO.ficha_socio_economica");
+    logSuccess("[OK] ficha_socio_economica - $cSE1 registros");
+
+    // 6) DEP (link por CLIENTE_UNIC)
+    $sqlDEP = "SELECT s.*
+                 INTO [$bdDestino].DBO.DEPENDENTES_CLIENTE
+                 FROM [$bdOrigem].DBO.mttbdep s
+                INNER JOIN [$bdDestino].DBO._temp_cliente_unic t ON t.cliente_unic = s.CLIENTE_UNIC
+                WHERE s.CODEMP IN ($codempList)";
+    if (!executarSQL($conn, $sqlDEP, 'Recriar DEPENDENTES_CLIENTE (DEP)')) return false;
+    $cDEP = contarRegistros($conn, "[$bdDestino].DBO.DEPENDENTES_CLIENTE");
+    logSuccess("[OK] DEPENDENTES_CLIENTE - $cDEP registros");
+
+    // 7) SE2 (link por CLIENTE_UNIC)
+    $sqlSE2 = "SELECT s.*
+                 INTO [$bdDestino].DBO.CADASTRO_INSCRICOES
+                 FROM [$bdOrigem].DBO.mttbse2 s
+                INNER JOIN [$bdDestino].DBO._temp_cliente_unic t ON t.cliente_unic = s.CLIENTE_UNIC
+                WHERE s.CODEMP IN ($codempList)";
+    if (!executarSQL($conn, $sqlSE2, 'Recriar CADASTRO_INSCRICOES (SE2)')) return false;
+    $cSE2 = contarRegistros($conn, "[$bdDestino].DBO.CADASTRO_INSCRICOES");
+    logSuccess("[OK] CADASTRO_INSCRICOES - $cSE2 registros");
+
+    // 8) Limpeza das temps
+    dropIfExists($conn, "[$bdDestino].DBO._temp_cpf");
+    dropIfExists($conn, "[$bdDestino].DBO._temp_cpf_final");
+    dropIfExists($conn, "[$bdDestino].DBO._temp_cliente_unic");
+
+    return true;
+}
+
 function contarRegistros($conn, string $tabela): int
 {
     $sql = "SELECT COUNT(*) AS total FROM $tabela";
@@ -465,17 +620,24 @@ if ($tipo === 'cliente') {
 $currentStep = 0;
 
 // ===================== FASE 0: CRIAR BANCO E CON_FIDC =====================
-if ($onlyFinalizers) {
-    // Em modo retomada, banco e CON_FIDC ja existem. So validamos e lemos os codemps.
+if ($onlyFinalizers || $onlyExceptions) {
+    // Em ambos os modos, banco e CON_FIDC ja existem. So validamos e lemos os codemps.
+    $rotuloModo = $onlyExceptions ? 'REPROCESSAR EXCECOES' : 'RETOMADA';
     logInfo("========================================");
-    logInfo("FASE 0: Modo RETOMADA - validando ambiente existente");
+    logInfo("FASE 0: Modo $rotuloModo - validando ambiente existente");
     logInfo("========================================");
 
     $checkDB = sqlsrv_query($conn, "SELECT DB_ID('$bdDestino') AS dbid");
     $rowDB = sqlsrv_fetch_array($checkDB, SQLSRV_FETCH_ASSOC);
     sqlsrv_free_stmt($checkDB);
     if (!$rowDB || $rowDB['dbid'] === null) {
-        logError("Banco [$bdDestino] nao existe. Modo retomada exige um banco ja processado.");
+        logError("Banco [$bdDestino] nao existe. Modo $rotuloModo exige um banco ja processado.");
+        sendEvent('done', ['success' => false]);
+        exit;
+    }
+
+    if ($onlyExceptions && !tabelaExiste($conn, $bdDestino, 'CON_FIDC')) {
+        logError("Tabela CON_FIDC nao existe em [$bdDestino]. Modo REPROCESSAR EXCECOES exige uma extracao Cliente previa completa.");
         sendEvent('done', ['success' => false]);
         exit;
     }
@@ -489,14 +651,19 @@ if ($onlyFinalizers) {
         sqlsrv_free_stmt($stmtCe);
     }
     if (empty($codemps)) {
+        if ($onlyExceptions) {
+            logError("CON_FIDC vazia em [$bdDestino]. Sem contratos, nao ha como reprocessar exceptions.");
+            sendEvent('done', ['success' => false]);
+            exit;
+        }
         logWarn("CON_FIDC vazia ou inexistente; finalizadores nao usam codemp diretamente, mas alguns helpers podem precisar.");
     } else {
         $codempList = implode(',', $codemps);
         $codempPrimeiro = $codemps[0];
-        logSuccess("Modo retomada: $bdDestino existe, codemps em CON_FIDC: $codempList");
+        logSuccess("Modo $rotuloModo: $bdDestino existe, codemps em CON_FIDC: $codempList");
     }
     $currentStep += 2; // pular os steps de "Criando CON_FIDC" e "CON_FIDC populada"
-    sendProgress($currentStep, $totalSteps, 'Modo retomada: ambiente validado');
+    sendProgress($currentStep, $totalSteps, "Modo $rotuloModo: ambiente validado");
 } else {
 
 logInfo("========================================");
@@ -653,6 +820,26 @@ sendProgress($currentStep, $totalSteps, 'CON_FIDC populada');
 
 // ===================== BRANCHING: CLIENTE vs SGH =====================
 if ($tipo === 'cliente') {
+
+// ===================== MODO: REPROCESSAR APENAS EXCECOES (SE1/DEP/SE2) =====================
+if ($onlyExceptions) {
+    $okExc = reprocessarExcecoes($conn, $bdOrigem, $bdDestino, $codempList);
+    if ($okExc) {
+        sendProgress($totalSteps, $totalSteps, 'Excecoes reprocessadas');
+        logSuccess("Reprocessamento de excecoes concluido com sucesso.");
+        sendEvent('done', [
+            'success'      => true,
+            'totalTabelas' => 3,
+            'banco'        => $bdDestino,
+            'hasReport'    => false,
+        ]);
+    } else {
+        logError("Falha ao reprocessar excecoes. Verifique o log acima.");
+        sendEvent('done', ['success' => false]);
+    }
+    sqlsrv_close($conn);
+    exit;
+}
 
 // ===================== FASE 1: TABELAS DE REFERENCIA =====================
 logInfo("");

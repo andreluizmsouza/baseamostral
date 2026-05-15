@@ -483,6 +483,15 @@
                         </div>
                     </label>
                 </div>
+                <div style="margin-top: 12px;">
+                    <label class="checkbox-group" for="chkOnlyExceptions">
+                        <input type="checkbox" id="chkOnlyExceptions" name="only_exceptions" value="1">
+                        <div>
+                            <div class="cb-label">&#128260; Reprocessar apenas exce&#231;&#245;es (SE1/DEP/SE2)</div>
+                            <div class="cb-desc">Apaga e recria somente as 3 tabelas de exce&#231;&#227;o: <b>ficha_socio_economica</b>, <b>DEPENDENTES_CLIENTE</b> e <b>CADASTRO_INSCRICOES</b>. Exige que o banco destino e a tabela CON_FIDC j&#225; existam. Aplica-se apenas ao modo Cliente.</div>
+                        </div>
+                    </label>
+                </div>
             </div>
 
             <div class="card">
@@ -641,9 +650,16 @@
 
             var onlyFinCheck = document.getElementById('chkOnlyFinalizers');
             var isRetomada = onlyFinCheck && onlyFinCheck.checked;
+            var onlyExcCheck = document.getElementById('chkOnlyExceptions');
+            var isOnlyExc = onlyExcCheck && onlyExcCheck.checked;
 
-            if (!isRetomada && (!fileInput.files || fileInput.files.length === 0)) {
+            if (!isRetomada && !isOnlyExc && (!fileInput.files || fileInput.files.length === 0)) {
                 alert('Selecione o arquivo TXT de contratos.');
+                return;
+            }
+
+            if (isOnlyExc && isRetomada) {
+                alert('Modo "Reprocessar exceções" e "Modo retomada" não podem ser usados juntos.');
                 return;
             }
 
@@ -682,6 +698,7 @@
             var skipBlobsCheck = document.getElementById('chkSkipBlobs');
             formData.append('skip_blobs', skipBlobsCheck && skipBlobsCheck.checked ? '1' : '0');
             formData.append('only_finalizers', isRetomada ? '1' : '0');
+            formData.append('only_exceptions', isOnlyExc ? '1' : '0');
             formData.append('tipo', document.getElementById('tipoInput').value);
 
             if (fileInput.files && fileInput.files.length > 0) {
@@ -697,6 +714,9 @@
             }
             if (isRetomada) {
                 addLog('warn', 'Modo RETOMADA ativado: tabelas serao puladas; rodar apenas IDENTITY/Constraints/Indices/Views/Procs.');
+            }
+            if (isOnlyExc) {
+                addLog('warn', 'Modo REPROCESSAR EXCECOES ativado: somente SE1/DEP/SE2 serao recriadas; demais tabelas preservadas.');
             }
 
             try {
