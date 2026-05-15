@@ -488,7 +488,7 @@
                         <input type="checkbox" id="chkOnlyExceptions" name="only_exceptions" value="1">
                         <div>
                             <div class="cb-label">&#128260; Reprocessar apenas exce&#231;&#245;es (SE1/DEP/SE2)</div>
-                            <div class="cb-desc">Apaga e recria somente as 3 tabelas de exce&#231;&#227;o: <b>ficha_socio_economica</b>, <b>DEPENDENTES_CLIENTE</b> e <b>CADASTRO_INSCRICOES</b>. Exige que o banco destino e a tabela CON_FIDC j&#225; existam. Aplica-se apenas ao modo Cliente.</div>
+                            <div class="cb-desc">Apaga e recria somente as 3 tabelas de exce&#231;&#227;o: <b>mttbse1</b>, <b>mttbdep</b> e <b>mttbse2</b>. Exige que o banco destino e a tabela CON_FIDC j&#225; existam. Aplica-se apenas ao modo SGH El&#243;gica.</div>
                         </div>
                     </label>
                 </div>
