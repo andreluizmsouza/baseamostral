@@ -807,8 +807,8 @@ if ($tipo === 'cliente') {
     $totalSteps += count(getPhase2_ContractFilteredTables());
     $totalSteps += count(getPhase3_PostProcessContratos());
     $totalSteps += count(getPhase4_ImovelUnicoTables());
-    $totalSteps += count(getPhase5_SE1_FichaSocioEconomica());
-    $totalSteps += count(getPhase6_DEP_SE2());
+    // SE1 + DEP + SE2 sao processadas por reprocessarExcecoes (3 tabelas)
+    $totalSteps += 3;
 } else {
     // SGH: sera calculado dinamicamente apos descobrir tabelas
     $totalSteps += 1; // placeholder para descoberta
@@ -1146,75 +1146,28 @@ foreach ($tabelasImovel as $tab) {
     sendProgress($currentStep, $totalSteps, 'Imovel: ' . $tab['nome']);
 }
 
-// ===================== FASE 5: SE1 - FICHA SOCIOECONOMICA =====================
-logInfo("");
-logInfo("========================================");
-logInfo("FASE 5: Ficha Socioeconomica (SE1) - Coleta de CPFs");
-logInfo("========================================");
-
-// Garantir temps limpas (evita falha em CREATE TABLE caso execucao anterior tenha sido interrompida)
+// ===================== FASES 5 e 6 (UNIFICADAS): SE1, DEP, SE2 =====================
+// Usa o helper reprocessarExcecoes que ja faz loop empresa por empresa,
+// remove dependencia de mttbhis e de COD_ADQ_PRIN, e recria as 3 tabelas
+// (ficha_socio_economica, DEPENDENTES_CLIENTE, CADASTRO_INSCRICOES) com
+// filtro restrito por contrato/CODEMP.
+//
+// Limpa quaisquer temps antigas das fases 5/6 que possam ter sobrado de
+// execucoes interrompidas, mesmo que essas fases nao sejam mais usadas.
 dropIfExists($conn, "[$bdDestino].DBO._temp_cpf");
 dropIfExists($conn, "[$bdDestino].DBO._temp_cpf_final");
-
-$se1Steps = getPhase5_SE1_FichaSocioEconomica();
-foreach ($se1Steps as $tab) {
-    $sql = substituirPlaceholders($tab['sql'], $bdOrigem, $bdDestino, $codempList);
-    // Se for SELECT ... INTO destino real (nao temp), usar wrapper inteligente
-    if (preg_match('/\bSELECT\b.*?\bINTO\s+(\S+)\s+FROM\b/is', $sql, $m) && stripos($m[1], '_temp') === false) {
-        // Extrair nome da tabela destino
-        $destFull = trim($m[1], "[]");
-        // Remove prefixos: pode ser bd.DBO.tabela ou [bd].DBO.[tabela]
-        $partes = explode('.', str_replace(['[', ']'], '', $destFull));
-        $destinoSoNome = end($partes);
-        $ok = executarSelectInto($conn, $sql, $tab['nome'], $bdDestino, $destinoSoNome, $codempList);
-    } else {
-        $ok = executarSQL($conn, $sql, $tab['nome']);
-    }
-    if ($ok) {
-        logSuccess("[OK] {$tab['nome']}");
-    }
-    $currentStep++;
-    sendProgress($currentStep, $totalSteps, 'SE1: ' . $tab['nome']);
-}
-
-// Contar SE1
-$countSE1 = contarRegistros($conn, "[$bdDestino].DBO.ficha_socio_economica");
-if ($countSE1 >= 0) {
-    logSuccess("Ficha Socioeconomica: $countSE1 registros.");
-}
-
-// ===================== FASE 6: DEP e SE2 =====================
-logInfo("");
-logInfo("========================================");
-logInfo("FASE 6: Dependentes (DEP) e Inscricoes (SE2)");
-logInfo("========================================");
-
 dropIfExists($conn, "[$bdDestino].DBO._temp_cod_adq");
 dropIfExists($conn, "[$bdDestino].DBO._temp_cod_adq_final");
 
-$depSe2Steps = getPhase6_DEP_SE2();
-foreach ($depSe2Steps as $tab) {
-    $sql = substituirPlaceholders($tab['sql'], $bdOrigem, $bdDestino, $codempList);
-    if (preg_match('/\bSELECT\b.*?\bINTO\s+(\S+)\s+FROM\b/is', $sql, $m) && stripos($m[1], '_temp') === false) {
-        $destFull = trim($m[1], "[]");
-        $partes = explode('.', str_replace(['[', ']'], '', $destFull));
-        $destinoSoNome = end($partes);
-        $ok = executarSelectInto($conn, $sql, $tab['nome'], $bdDestino, $destinoSoNome, $codempList);
-    } else {
-        $ok = executarSQL($conn, $sql, $tab['nome']);
-    }
-    if ($ok) {
-        logSuccess("[OK] {$tab['nome']}");
-    }
-    $currentStep++;
-    sendProgress($currentStep, $totalSteps, 'DEP/SE2: ' . $tab['nome']);
+if (!reprocessarExcecoes($conn, 'cliente', $bdOrigem, $bdDestino, $codempList)) {
+    logError("Falha ao processar SE1/DEP/SE2.");
+    sendEvent('done', ['success' => false]);
+    exit;
 }
-
-// Contar DEP e SE2
-$countDEP = contarRegistros($conn, "[$bdDestino].DBO.DEPENDENTES_CLIENTE");
-$countSE2 = contarRegistros($conn, "[$bdDestino].DBO.CADASTRO_INSCRICOES");
-if ($countDEP >= 0) logSuccess("Dependentes: $countDEP registros.");
-if ($countSE2 >= 0) logSuccess("Inscricoes: $countSE2 registros.");
+// Avancar o currentStep equivalente ao numero de steps das fases 5/6 antigas
+// para manter a barra de progresso coerente
+$currentStep += 3;
+sendProgress($currentStep, $totalSteps, 'SE1/DEP/SE2 reprocessadas');
 
 } else {
 // ===================== MODO SGH ELOGICA =====================
@@ -1253,167 +1206,10 @@ function getTableColumns($conn, string $banco, string $tabela): array
     return $cols;
 }
 
-/**
- * Pre-computa temp de CPFs para filtrar mttbse1 no modo SGH.
- * Coleta CPFs de mttbcon (ADQ1-4, DATU_CGC_CPF, DATU_AD2-4) e mttbhis (AD1-4)
- * restritos aos contratos da CON_FIDC, depois normaliza para CHAR(14).
- */
-function sghCriarTempCPF($conn, string $bdOrigem, string $bdDestino): bool
-{
-    // Limpar se sobrou de execucao anterior
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf");
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
-
-    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_cpf (cpf CHAR(14))", "SGH: criar _sgh_temp_cpf")) {
-        return false;
-    }
-
-    $camposCon = ['ADQ1_CPFCGC', 'ADQ2_CPF', 'ADQ3_CPF', 'ADQ4_CPF', 'DATU_CGC_CPF', 'DATU_AD2_CPF', 'DATU_AD3_CPF', 'DATU_AD4_CPF'];
-    $colsCon = getTableColumns($conn, $bdOrigem, 'mttbcon');
-    $totalCon = count(array_intersect($camposCon, $colsCon));
-    $i = 0;
-    foreach ($camposCon as $campo) {
-        if (!in_array($campo, $colsCon)) continue;
-        $i++;
-        logInfo("  CPF $i/$totalCon: coletando $campo de mttbcon...");
-        $sql = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf
-                SELECT DISTINCT c.[$campo] FROM [$bdOrigem].DBO.mttbcon c
-                WHERE c.[$campo] IS NOT NULL
-                  AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
-                              WHERE X.CODEMP = c.CODEMP AND X.REGIAO = c.REGIAO
-                                AND X.NUCLEO = c.NUCLEO AND X.CONTRATO = c.CONTRATO)";
-        executarSQL($conn, $sql, "SGH: coletar CPF $campo (mttbcon)");
-    }
-
-    $camposHis = ['AD1_CGCCPF', 'AD2_CPF', 'AD3_CPF', 'AD4_CPF'];
-    $colsHis = getTableColumns($conn, $bdOrigem, 'mttbhis');
-    if (!empty($colsHis)) {
-        $totalHis = count(array_intersect($camposHis, $colsHis));
-        $j = 0;
-        foreach ($camposHis as $campo) {
-            if (!in_array($campo, $colsHis)) continue;
-            $j++;
-            logInfo("  CPF $j/$totalHis: coletando $campo de mttbhis...");
-            $sql = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf
-                    SELECT DISTINCT h.[$campo] FROM [$bdOrigem].DBO.mttbhis h
-                    WHERE h.[$campo] IS NOT NULL
-                      AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
-                                  WHERE X.CODEMP = h.CODEMP AND X.REGIAO = h.REGIAO
-                                    AND X.NUCLEO = h.NUCLEO AND X.CONTRATO = h.CONTRATO)";
-            executarSQL($conn, $sql, "SGH: coletar CPF $campo (mttbhis)");
-        }
-    }
-
-    // Normalizar para CHAR(14) com zeros a esquerda
-    logInfo("  CPF: normalizando para CHAR(14)...");
-    executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_cpf_final (cpf CHAR(14))", "SGH: criar _sgh_temp_cpf_final");
-    $sqlNorm = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf_final
-                SELECT DISTINCT RIGHT('00000000000000' + LTRIM(RTRIM(t.cpf)), 14)
-                FROM [$bdDestino].DBO._sgh_temp_cpf t
-                WHERE t.cpf IS NOT NULL AND LTRIM(RTRIM(t.cpf)) <> ''";
-    return executarSQL($conn, $sqlNorm, "SGH: normalizar CPFs");
-}
-
-/**
- * Pre-computa temp de COD_ADQ para filtrar mttbdep e mttbse2 no modo SGH.
- * No Cliente vem da CADASTRO_FINANCIAMENTO; aqui usamos mttbcon da origem
- * (COD_ADQ_PRIN, COD_COADQ1/2/3) filtrada via CON_FIDC.
- */
-function sghCriarTempCodAdq($conn, string $bdOrigem, string $bdDestino): bool
-{
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_codadq");
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_codadq_final");
-
-    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_codadq (codadq INT)", "SGH: criar _sgh_temp_codadq")) {
-        return false;
-    }
-
-    $colsCon = getTableColumns($conn, $bdOrigem, 'mttbcon');
-    $campos = ['COD_ADQ_PRIN', 'COD_COADQ1', 'COD_COADQ2', 'COD_COADQ3'];
-    $total = count(array_intersect($campos, $colsCon));
-    $i = 0;
-    foreach ($campos as $campo) {
-        if (!in_array($campo, $colsCon)) continue;
-        $i++;
-        logInfo("  COD_ADQ $i/$total: coletando $campo de mttbcon...");
-        $sql = "INSERT INTO [$bdDestino].DBO._sgh_temp_codadq
-                SELECT DISTINCT c.[$campo] FROM [$bdOrigem].DBO.mttbcon c
-                WHERE c.[$campo] IS NOT NULL AND c.[$campo] <> 0
-                  AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
-                              WHERE X.CODEMP = c.CODEMP AND X.REGIAO = c.REGIAO
-                                AND X.NUCLEO = c.NUCLEO AND X.CONTRATO = c.CONTRATO)";
-        executarSQL($conn, $sql, "SGH: coletar $campo (mttbcon)");
-    }
-
-    logInfo("  COD_ADQ: consolidando codigos distintos...");
-    executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_codadq_final (codadq INT)", "SGH: criar _sgh_temp_codadq_final");
-    return executarSQL($conn, "INSERT INTO [$bdDestino].DBO._sgh_temp_codadq_final
-                                SELECT DISTINCT t.codadq FROM [$bdDestino].DBO._sgh_temp_codadq t
-                                WHERE t.codadq IS NOT NULL AND t.codadq <> 0", "SGH: distinct COD_ADQ");
-}
-
-/**
- * Processa mttbse1 no modo SGH: filtra por CGCCPF relacionado aos contratos.
- */
-function sghProcessarSE1($conn, string $bdOrigem, string $bdDestino, string $codempList, bool $tabelaExiste): bool
-{
-    if ($tabelaExiste) {
-        executarSQL($conn, "DELETE FROM [$bdDestino].DBO.mttbse1 WHERE CODEMP IN ($codempList)", "SGH: DELETE mttbse1 CODEMP IN ($codempList)");
-        $sql = "INSERT INTO [$bdDestino].DBO.mttbse1
-                SELECT s.* FROM [$bdOrigem].DBO.mttbse1 s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_cpf_final t ON t.cpf = s.CGCCPF
-                WHERE s.CODEMP IN ($codempList)";
-        return executarSQL($conn, $sql, "SGH: INSERT mttbse1 (por CPF)");
-    } else {
-        $sql = "SELECT s.* INTO [$bdDestino].DBO.mttbse1
-                FROM [$bdOrigem].DBO.mttbse1 s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_cpf_final t ON t.cpf = s.CGCCPF
-                WHERE s.CODEMP IN ($codempList)";
-        return executarSQL($conn, $sql, "SGH: SELECT INTO mttbse1 (por CPF)");
-    }
-}
-
-/**
- * Processa mttbdep no modo SGH: filtra por CLIENTE_UNIC relacionado aos codigos adquirentes.
- */
-function sghProcessarDEP($conn, string $bdOrigem, string $bdDestino, string $codempList, bool $tabelaExiste): bool
-{
-    if ($tabelaExiste) {
-        executarSQL($conn, "DELETE FROM [$bdDestino].DBO.mttbdep WHERE CODEMP IN ($codempList)", "SGH: DELETE mttbdep CODEMP IN ($codempList)");
-        $sql = "INSERT INTO [$bdDestino].DBO.mttbdep
-                SELECT s.* FROM [$bdOrigem].DBO.mttbdep s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_codadq_final t ON t.codadq = s.cliente_unic
-                WHERE s.CODEMP IN ($codempList) AND t.codadq <> 0";
-        return executarSQL($conn, $sql, "SGH: INSERT mttbdep (por COD_ADQ)");
-    } else {
-        $sql = "SELECT s.* INTO [$bdDestino].DBO.mttbdep
-                FROM [$bdOrigem].DBO.mttbdep s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_codadq_final t ON t.codadq = s.cliente_unic
-                WHERE s.CODEMP IN ($codempList) AND t.codadq <> 0";
-        return executarSQL($conn, $sql, "SGH: SELECT INTO mttbdep (por COD_ADQ)");
-    }
-}
-
-/**
- * Processa mttbse2 no modo SGH: filtra por CLIENTE_UNIC relacionado aos codigos adquirentes.
- */
-function sghProcessarSE2($conn, string $bdOrigem, string $bdDestino, string $codempList, bool $tabelaExiste): bool
-{
-    if ($tabelaExiste) {
-        executarSQL($conn, "DELETE FROM [$bdDestino].DBO.mttbse2 WHERE CODEMP IN ($codempList)", "SGH: DELETE mttbse2 CODEMP IN ($codempList)");
-        $sql = "INSERT INTO [$bdDestino].DBO.mttbse2
-                SELECT s.* FROM [$bdOrigem].DBO.mttbse2 s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_codadq_final t ON t.codadq = s.cliente_unic
-                WHERE s.CODEMP IN ($codempList)";
-        return executarSQL($conn, $sql, "SGH: INSERT mttbse2 (por COD_ADQ)");
-    } else {
-        $sql = "SELECT s.* INTO [$bdDestino].DBO.mttbse2
-                FROM [$bdOrigem].DBO.mttbse2 s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_codadq_final t ON t.codadq = s.cliente_unic
-                WHERE s.CODEMP IN ($codempList)";
-        return executarSQL($conn, $sql, "SGH: SELECT INTO mttbse2 (por COD_ADQ)");
-    }
-}
+// As funcoes antigas sghCriarTempCPF, sghCriarTempCodAdq, sghProcessarSE1,
+// sghProcessarDEP e sghProcessarSE2 foram removidas. mttbse1/mttbdep/mttbse2
+// no modo SGH agora sao processadas em loop empresa por empresa via
+// reprocessarExcecoes($conn, 'sgh', ...) chamada apos o loop principal.
 
 /**
  * Processa mttbjur (Processos Juridicos) no modo SGH.
@@ -1937,37 +1733,20 @@ if ($onlyFinalizers) {
 } else {
 // ---------- Pre-processamento das tabelas especiais (mttbse1, mttbdep, mttbse2) ----------
 // Essas 3 tabelas nao tem o quarteto CODEMP+REGIAO+NUCLEO+CONTRATO,
-// entao precisam de filtragem relacional (por CPF ou COD_ADQ) igual ao modo Cliente.
+// entao precisam de filtragem relacional (por CPF e CLIENTE_UNIC). Em vez de
+// pre-computar temps globais aqui, deixamos essas 3 tabelas para serem
+// reprocessadas em loop empresa por empresa apos o loop principal,
+// chamando reprocessarExcecoes($conn, 'sgh', ...).
 $tabelasOrigemLower = array_map('strtolower', $tabelasOrigem);
 $temSE1 = in_array('mttbse1', $tabelasOrigemLower);
 $temDEP = in_array('mttbdep', $tabelasOrigemLower);
 $temSE2 = in_array('mttbse2', $tabelasOrigemLower);
-$tempCPFok = false;
-$tempCodAdqOk = false;
 
-if ($temSE1) {
-    logInfo("");
-    logInfo("SGH: pre-computando CPFs relacionados aos contratos (para mttbse1)...");
-    $tempCPFok = sghCriarTempCPF($conn, $bdOrigem, $bdDestino);
-    if ($tempCPFok) {
-        $n = contarRegistros($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
-        logSuccess("SGH: $n CPFs distintos coletados para filtrar mttbse1.");
-    } else {
-        logWarn("SGH: falha ao pre-computar CPFs; mttbse1 sera pulada.");
-    }
-}
-
-if ($temDEP || $temSE2) {
-    logInfo("");
-    logInfo("SGH: pre-computando codigos adquirentes (para mttbdep/mttbse2)...");
-    $tempCodAdqOk = sghCriarTempCodAdq($conn, $bdOrigem, $bdDestino);
-    if ($tempCodAdqOk) {
-        $n = contarRegistros($conn, "[$bdDestino].DBO._sgh_temp_codadq_final");
-        logSuccess("SGH: $n codigos adquirentes distintos coletados para filtrar mttbdep/mttbse2.");
-    } else {
-        logWarn("SGH: falha ao pre-computar codigos adquirentes; mttbdep/mttbse2 serao puladas.");
-    }
-}
+// Limpar temps antigas que possam ter sobrado de execucoes anteriores
+dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf");
+dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
+dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_codadq");
+dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_codadq_final");
 
 // ---------- Pre-processamento do MODULO DOSSIE/RECURSO ----------
 // Cadeia: cadmut (de MTTBCON via CON_FIDC) -> CDEC, COIC -> ... -> DOC, URA
@@ -2139,60 +1918,14 @@ foreach ($tabelasOrigem as $tabela) {
     sendProgress($currentStep, $totalSteps, "Processando: $tabela");
     logInfo("Processando $tabela...");
 
-    // ---------- CASO ESPECIAL 1: mttbse1 (filtro por CPF) ----------
-    if ($tabelaLower === 'mttbse1') {
-        if ($tempCPFok) {
-            $ok = sghProcessarSE1($conn, $bdOrigem, $bdDestino, $codempList, $tabelaExiste);
-            if ($ok) {
-                $count = contarRegistros($conn, "[$bdDestino].DBO.mttbse1");
-                logSuccess("[OK] mttbse1 (especial: por CPF) - $count registros");
-                $countEspecial++;
-                if ($tabelaExiste) $countInsert++; else $countSelectInto++;
-            }
-        } else {
-            logWarn("[SKIP] mttbse1: temp de CPFs indisponivel.");
-            $countPulou++;
-        }
+    // ---------- mttbse1 / mttbdep / mttbse2: tratadas em bloco apos o loop ----------
+    // Essas 3 tabelas precisam de filtragem relacional empresa por empresa
+    // (CPF e CLIENTE_UNIC) e sao processadas em massa por reprocessarExcecoes()
+    // chamada depois do loop principal.
+    if ($tabelaLower === 'mttbse1' || $tabelaLower === 'mttbdep' || $tabelaLower === 'mttbse2') {
+        logInfo("[$tabela]: sera processada apos o loop principal por reprocessarExcecoes (loop empresa por empresa).");
         $currentStep++;
-        sendProgress($currentStep, $totalSteps, "SGH especial: mttbse1");
-        continue;
-    }
-
-    // ---------- CASO ESPECIAL 2: mttbdep (filtro por COD_ADQ) ----------
-    if ($tabelaLower === 'mttbdep') {
-        if ($tempCodAdqOk) {
-            $ok = sghProcessarDEP($conn, $bdOrigem, $bdDestino, $codempList, $tabelaExiste);
-            if ($ok) {
-                $count = contarRegistros($conn, "[$bdDestino].DBO.mttbdep");
-                logSuccess("[OK] mttbdep (especial: por COD_ADQ) - $count registros");
-                $countEspecial++;
-                if ($tabelaExiste) $countInsert++; else $countSelectInto++;
-            }
-        } else {
-            logWarn("[SKIP] mttbdep: temp de COD_ADQ indisponivel.");
-            $countPulou++;
-        }
-        $currentStep++;
-        sendProgress($currentStep, $totalSteps, "SGH especial: mttbdep");
-        continue;
-    }
-
-    // ---------- CASO ESPECIAL 3: mttbse2 (filtro por COD_ADQ) ----------
-    if ($tabelaLower === 'mttbse2') {
-        if ($tempCodAdqOk) {
-            $ok = sghProcessarSE2($conn, $bdOrigem, $bdDestino, $codempList, $tabelaExiste);
-            if ($ok) {
-                $count = contarRegistros($conn, "[$bdDestino].DBO.mttbse2");
-                logSuccess("[OK] mttbse2 (especial: por COD_ADQ) - $count registros");
-                $countEspecial++;
-                if ($tabelaExiste) $countInsert++; else $countSelectInto++;
-            }
-        } else {
-            logWarn("[SKIP] mttbse2: temp de COD_ADQ indisponivel.");
-            $countPulou++;
-        }
-        $currentStep++;
-        sendProgress($currentStep, $totalSteps, "SGH especial: mttbse2");
+        sendProgress($currentStep, $totalSteps, "SGH adiada: $tabela");
         continue;
     }
 
@@ -2579,11 +2312,26 @@ foreach ($tabelasOrigem as $tabela) {
 }
 
 logInfo("");
-logInfo("Resumo SGH: $countContrato por contrato | $countCodemp por empresa | $countIntegral integral | $countEspecial especiais (SE1/DEP/SE2)");
+logInfo("Resumo SGH: $countContrato por contrato | $countCodemp por empresa | $countIntegral integral");
 if ($countInsert > 0) logInfo("Multi-empresa: $countInsert INSERT + $countSelectInto SELECT INTO");
 if ($countPulou > 0) logInfo("Tabelas puladas: $countPulou");
 
-// Limpar temps do pre-processamento especial
+// ---------- Processar mttbse1/mttbdep/mttbse2 (excecoes) ----------
+// Loop empresa por empresa via funcao unificada (mesma do "Reprocessar
+// apenas excecoes"). Coleta CPFs de mttbcon dos contratos da CON_FIDC,
+// resolve CLIENTE_UNIC via mttbse2, e recria as 3 tabelas com indices.
+if ($temSE1 || $temDEP || $temSE2) {
+    if (!reprocessarExcecoes($conn, 'sgh', $bdOrigem, $bdDestino, $codempList)) {
+        logError("Falha ao processar mttbse1/mttbdep/mttbse2.");
+        sendEvent('done', ['success' => false]);
+        exit;
+    }
+} else {
+    logInfo("Nenhuma das tabelas mttbse1/mttbdep/mttbse2 existe na origem; nada a processar.");
+}
+
+// Limpar temps do pre-processamento especial (caso tenham sido criadas
+// por execucoes anteriores antes da refatoracao)
 dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf");
 dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
 dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_codadq");
