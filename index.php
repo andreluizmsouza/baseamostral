@@ -488,7 +488,7 @@
                         <input type="checkbox" id="chkOnlyExceptions" name="only_exceptions" value="1">
                         <div>
                             <div class="cb-label">&#128260; Reprocessar apenas exce&#231;&#245;es (SE1/DEP/SE2)</div>
-                            <div class="cb-desc">Apaga e recria somente as 3 tabelas de exce&#231;&#227;o. <b>Cliente:</b> ficha_socio_economica, DEPENDENTES_CLIENTE, CADASTRO_INSCRICOES. <b>SGH:</b> mttbse1, mttbdep, mttbse2. Exige que o banco destino e a CON_FIDC j&#225; existam. <b>Dica:</b> preencha CODEMP acima para restringir a uma empresa; deixe vazio para reprocessar todas presentes na CON_FIDC.</div>
+                            <div class="cb-desc">Apaga e recria somente as 3 tabelas de exce&#231;&#227;o, <b>processando empresa por empresa</b> (loop sobre os CODEMPs presentes na CON_FIDC). Cada empresa e isolada do filtro das outras. <b>Cliente:</b> ficha_socio_economica, DEPENDENTES_CLIENTE, CADASTRO_INSCRICOES. <b>SGH:</b> mttbse1, mttbdep, mttbse2. Exige banco destino e CON_FIDC j&#225; existindo. Voc&#234; pode deixar o CODEMP vazio acima (processa todas da CON_FIDC) ou preencher para restringir a uma/algumas empresas.</div>
                         </div>
                     </label>
                 </div>
