@@ -508,7 +508,7 @@ function excCriarTempCPF($conn, string $bdOrigem, string $bdDestino, string $cod
     foreach ($camposCon as $campo) {
         if (!in_array($campo, $colsCon)) continue;
         $i++;
-        logInfo("  CPF $i/$totalCon: coletando $campo de mttbcon (CODEMP IN ($codempList))...");
+        $antes = contarRegistros($conn, "[$bdDestino].DBO._exc_temp_cpf");
         $sql = "INSERT INTO [$bdDestino].DBO._exc_temp_cpf
                 SELECT DISTINCT c.[$campo] FROM [$bdOrigem].DBO.mttbcon c
                 WHERE c.[$campo] IS NOT NULL
@@ -518,6 +518,9 @@ function excCriarTempCPF($conn, string $bdOrigem, string $bdDestino, string $cod
                                 AND X.CODEMP = c.CODEMP AND X.REGIAO = c.REGIAO
                                 AND X.NUCLEO = c.NUCLEO AND X.CONTRATO = c.CONTRATO)";
         executarSQL($conn, $sql, "EXC: coletar CPF $campo (mttbcon)");
+        $depois = contarRegistros($conn, "[$bdDestino].DBO._exc_temp_cpf");
+        $diff = $depois - $antes;
+        logInfo("  CPF $i/$totalCon: $campo (mttbcon) -> +$diff linhas (total bruto: $depois)");
     }
 
     // NOTA: mttbhis (historico de adquirentes) NAO e usado no reprocessamento
@@ -675,11 +678,39 @@ function reprocessarExcecoes($conn, string $modo, string $bdOrigem, string $bdDe
     dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cliente_unic");
 
     // 2) Coletar CPFs filtrados por CODEMP
+    // DIAGNOSTICO PREVIO: quantos contratos da CON_FIDC casam com o filtro
+    $cntCon = contarRegistros($conn, "(SELECT 1 FROM [$bdDestino].DBO.CON_FIDC WHERE CODEMP IN ($codempList)) X");
+    logInfo("DIAG: contratos em CON_FIDC com CODEMP IN ($codempList): $cntCon");
+
+    // Quantas linhas de mttbcon casam (deveria ser igual a $cntCon)
+    $sqlCntCon = "SELECT COUNT(*) AS total FROM [$bdOrigem].DBO.mttbcon c
+                  WHERE c.CODEMP IN ($codempList)
+                    AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
+                                WHERE X.CODEMP IN ($codempList)
+                                  AND X.CODEMP = c.CODEMP AND X.REGIAO = c.REGIAO
+                                  AND X.NUCLEO = c.NUCLEO AND X.CONTRATO = c.CONTRATO)";
+    $stmtD = sqlsrv_query($conn, $sqlCntCon);
+    if ($stmtD) {
+        $rD = sqlsrv_fetch_array($stmtD, SQLSRV_FETCH_ASSOC);
+        sqlsrv_free_stmt($stmtD);
+        logInfo("DIAG: linhas de mttbcon (origem) casando com CON_FIDC: " . ($rD['total'] ?? '?'));
+    }
+
     if (!excCriarTempCPF($conn, $bdOrigem, $bdDestino, $codempList)) {
         return false;
     }
+    $cntCpfBruto = contarRegistros($conn, "[$bdDestino].DBO._exc_temp_cpf");
     $cntCpf = contarRegistros($conn, "[$bdDestino].DBO._exc_temp_cpf_final");
-    logSuccess("CPFs distintos coletados (CODEMP IN ($codempList)): $cntCpf");
+    logSuccess("CPFs coletados: $cntCpfBruto linhas brutas em _exc_temp_cpf, $cntCpf CPFs distintos em _exc_temp_cpf_final (CODEMP IN ($codempList))");
+
+    // Amostra de ate 10 CPFs do _exc_temp_cpf_final pro log
+    $stmtSmp = sqlsrv_query($conn, "SELECT TOP 10 cpf FROM [$bdDestino].DBO._exc_temp_cpf_final ORDER BY cpf");
+    if ($stmtSmp) {
+        $amostra = [];
+        while ($r = sqlsrv_fetch_array($stmtSmp, SQLSRV_FETCH_ASSOC)) $amostra[] = $r['cpf'];
+        sqlsrv_free_stmt($stmtSmp);
+        logInfo("DIAG: amostra dos CPFs coletados (TOP 10): " . implode(', ', $amostra));
+    }
 
     // 3) Resolver CLIENTE_UNIC via mttbse2 filtrando por CODEMP
     if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._exc_temp_cliente_unic (cliente_unic BIGINT)",
@@ -732,10 +763,9 @@ function reprocessarExcecoes($conn, string $modo, string $bdOrigem, string $bdDe
         logInfo("Modo Cliente: indices nao sao recriados (nomes destino diferem da origem).");
     }
 
-    // 8) Limpeza
-    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cpf");
-    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cpf_final");
-    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cliente_unic");
+    // 8) DIAGNOSTICO: NAO dropar as temps - mantem no destino para inspecao
+    logWarn("DIAG: temps _exc_temp_cpf / _exc_temp_cpf_final / _exc_temp_cliente_unic MANTIDAS no destino para inspecao manual.");
+    logWarn("DIAG: rode no destino: SELECT * FROM _exc_temp_cpf_final;  SELECT CGCCPF, COUNT(*) FROM $tabSE1 GROUP BY CGCCPF ORDER BY 2 DESC;");
 
     return true;
 }
