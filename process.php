@@ -114,8 +114,8 @@ if ($onlyFinalizers && $tipo !== 'sgh') {
     exit;
 }
 
-if ($onlyExceptions && $tipo !== 'sgh') {
-    logError("Modo REPROCESSAR EXCECOES so esta disponivel no SGH Elogica.");
+if ($onlyExceptions && !in_array($tipo, ['cliente', 'sgh'], true)) {
+    logError("Modo REPROCESSAR EXCECOES so esta disponivel nos modos Cliente ou SGH.");
     sendEvent('done', ['success' => false]);
     exit;
 }
@@ -469,6 +469,291 @@ function contarRegistros($conn, string $tabela): int
     return $row ? (int)$row['total'] : -1;
 }
 
+// =====================================================================
+// HELPERS DE REPROCESSAMENTO DE EXCECOES (mttbse1, mttbdep, mttbse2)
+// Usados pelo modo "only_exceptions" tanto em Cliente quanto em SGH.
+// =====================================================================
+
+function listarColunasOrigem($conn, string $banco, string $tabela): array
+{
+    $sql = "SELECT COLUMN_NAME FROM [$banco].INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '$tabela'";
+    $stmt = sqlsrv_query($conn, $sql);
+    $cols = [];
+    if ($stmt) {
+        while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
+            $cols[] = strtoupper($row['COLUMN_NAME']);
+        }
+        sqlsrv_free_stmt($stmt);
+    }
+    return $cols;
+}
+
+/**
+ * Coleta CPFs em _exc_temp_cpf / _exc_temp_cpf_final filtrados pelos
+ * contratos da CON_FIDC restritos a CODEMP IN ($codempList).
+ */
+function excCriarTempCPF($conn, string $bdOrigem, string $bdDestino, string $codempList): bool
+{
+    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cpf");
+    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cpf_final");
+
+    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._exc_temp_cpf (cpf CHAR(14))", "EXC: criar _exc_temp_cpf")) {
+        return false;
+    }
+
+    $camposCon = ['ADQ1_CPFCGC', 'ADQ2_CPF', 'ADQ3_CPF', 'ADQ4_CPF', 'DATU_CGC_CPF', 'DATU_AD2_CPF', 'DATU_AD3_CPF', 'DATU_AD4_CPF'];
+    $colsCon = listarColunasOrigem($conn, $bdOrigem, 'mttbcon');
+    $totalCon = count(array_intersect($camposCon, $colsCon));
+    $i = 0;
+    foreach ($camposCon as $campo) {
+        if (!in_array($campo, $colsCon)) continue;
+        $i++;
+        logInfo("  CPF $i/$totalCon: coletando $campo de mttbcon (CODEMP IN ($codempList))...");
+        $sql = "INSERT INTO [$bdDestino].DBO._exc_temp_cpf
+                SELECT DISTINCT c.[$campo] FROM [$bdOrigem].DBO.mttbcon c
+                WHERE c.[$campo] IS NOT NULL
+                  AND c.CODEMP IN ($codempList)
+                  AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
+                              WHERE X.CODEMP IN ($codempList)
+                                AND X.CODEMP = c.CODEMP AND X.REGIAO = c.REGIAO
+                                AND X.NUCLEO = c.NUCLEO AND X.CONTRATO = c.CONTRATO)";
+        executarSQL($conn, $sql, "EXC: coletar CPF $campo (mttbcon)");
+    }
+
+    $camposHis = ['AD1_CGCCPF', 'AD2_CPF', 'AD3_CPF', 'AD4_CPF'];
+    $colsHis = listarColunasOrigem($conn, $bdOrigem, 'mttbhis');
+    if (!empty($colsHis)) {
+        $totalHis = count(array_intersect($camposHis, $colsHis));
+        $j = 0;
+        foreach ($camposHis as $campo) {
+            if (!in_array($campo, $colsHis)) continue;
+            $j++;
+            logInfo("  CPF $j/$totalHis: coletando $campo de mttbhis (CODEMP IN ($codempList))...");
+            $sql = "INSERT INTO [$bdDestino].DBO._exc_temp_cpf
+                    SELECT DISTINCT h.[$campo] FROM [$bdOrigem].DBO.mttbhis h
+                    WHERE h.[$campo] IS NOT NULL
+                      AND h.CODEMP IN ($codempList)
+                      AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
+                                  WHERE X.CODEMP IN ($codempList)
+                                    AND X.CODEMP = h.CODEMP AND X.REGIAO = h.REGIAO
+                                    AND X.NUCLEO = h.NUCLEO AND X.CONTRATO = h.CONTRATO)";
+            executarSQL($conn, $sql, "EXC: coletar CPF $campo (mttbhis)");
+        }
+    }
+
+    logInfo("  CPF: normalizando para CHAR(14)...");
+    executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._exc_temp_cpf_final (cpf CHAR(14))", "EXC: criar _exc_temp_cpf_final");
+    $sqlNorm = "INSERT INTO [$bdDestino].DBO._exc_temp_cpf_final
+                SELECT DISTINCT RIGHT('00000000000000' + LTRIM(RTRIM(t.cpf)), 14)
+                FROM [$bdDestino].DBO._exc_temp_cpf t
+                WHERE t.cpf IS NOT NULL AND LTRIM(RTRIM(t.cpf)) <> ''";
+    return executarSQL($conn, $sqlNorm, "EXC: normalizar CPFs");
+}
+
+/**
+ * Recria indices nao-PK/UQ das tabelas indicadas no destino, lendo a
+ * definicao da sys.indexes do banco origem. Usado apos SELECT INTO
+ * (que nao herda indices).
+ */
+function excRecriarIndicesDeTabelas($conn, string $bdOrigem, string $bdDestino, array $tabelas): void
+{
+    if (empty($tabelas)) return;
+    $inList = "'" . implode("','", array_map(fn($t) => strtolower($t), $tabelas)) . "'";
+
+    $sqlIdx = "
+    SELECT
+        t.name AS tabela,
+        i.name AS idx_nome,
+        i.is_unique,
+        i.type_desc,
+        i.filter_definition,
+        STUFF((
+            SELECT ',[' + c.name + ']' + CASE WHEN ic.is_descending_key = 1 THEN ' DESC' ELSE '' END
+            FROM [$bdOrigem].sys.index_columns ic
+            INNER JOIN [$bdOrigem].sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+            ORDER BY ic.key_ordinal
+            FOR XML PATH('')
+        ), 1, 1, '') AS colunas_chave,
+        STUFF((
+            SELECT ',[' + c.name + ']'
+            FROM [$bdOrigem].sys.index_columns ic
+            INNER JOIN [$bdOrigem].sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1
+            ORDER BY ic.index_column_id
+            FOR XML PATH('')
+        ), 1, 1, '') AS colunas_include
+    FROM [$bdOrigem].sys.indexes i
+    INNER JOIN [$bdOrigem].sys.tables t ON i.object_id = t.object_id
+    WHERE i.type IN (1,2)
+      AND i.is_primary_key = 0
+      AND i.is_unique_constraint = 0
+      AND i.name IS NOT NULL
+      AND LOWER(t.name) IN ($inList)
+    ORDER BY t.name, i.name
+    ";
+    $stmt = sqlsrv_query($conn, $sqlIdx);
+    if (!$stmt) {
+        logWarn("Nao foi possivel listar indices da origem para as tabelas alvo.");
+        return;
+    }
+    $idxOk = 0;
+    $idxErro = 0;
+    while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
+        $tab = $row['tabela'];
+        $nomeIdx = $row['idx_nome'];
+        if (empty($row['colunas_chave'])) continue;
+        $unique = $row['is_unique'] ? 'UNIQUE ' : '';
+        $clustered = (strpos($row['type_desc'], 'CLUSTERED') !== false && strpos($row['type_desc'], 'NONCLUSTERED') === false) ? 'CLUSTERED ' : 'NONCLUSTERED ';
+        $colsKey = $row['colunas_chave'];
+        $colsInc = $row['colunas_include'] ?? '';
+        $filterDef = $row['filter_definition'] ?? '';
+        $includeClause = !empty($colsInc) ? " INCLUDE ($colsInc)" : '';
+        $whereClause   = !empty($filterDef) ? " WHERE $filterDef" : '';
+
+        $sqlCreate = "IF NOT EXISTS (SELECT 1 FROM [$bdDestino].sys.indexes
+                                     WHERE name = '$nomeIdx'
+                                       AND object_id = OBJECT_ID('[$bdDestino].DBO.[$tab]'))
+                      CREATE {$unique}{$clustered}INDEX [$nomeIdx] ON [$bdDestino].DBO.[$tab] ($colsKey){$includeClause}{$whereClause}";
+
+        $stmtCreate = sqlsrv_query($conn, $sqlCreate, [], ['QueryTimeout' => 0]);
+        if ($stmtCreate === false) {
+            $errs = sqlsrv_errors();
+            $msg = $errs ? trim($errs[0]['message']) : 'erro desconhecido';
+            $msg = preg_replace('/^\[[^\]]+\]\s*\[[^\]]+\]\s*\[[^\]]+\]\s*/', '', $msg);
+            logWarn("  [FALHA] Indice $nomeIdx em $tab: $msg");
+            $idxErro++;
+        } else {
+            while (sqlsrv_next_result($stmtCreate)) {}
+            sqlsrv_free_stmt($stmtCreate);
+            logInfo("  [OK] Indice $nomeIdx em $tab");
+            $idxOk++;
+        }
+    }
+    sqlsrv_free_stmt($stmt);
+    logSuccess("Indices recriados: $idxOk OK / $idxErro falhas");
+}
+
+/**
+ * Reprocessa as 3 tabelas de excecao (mttbse1/mttbdep/mttbse2).
+ * - modo 'sgh':     destino = mttbse1, mttbdep, mttbse2  (SELECT s.*)
+ * - modo 'cliente': destino = ficha_socio_economica, DEPENDENTES_CLIENTE, CADASTRO_INSCRICOES
+ * Resolve CLIENTE_UNIC via mttbse2 (CGC_CPF -> CLIENTE_UNIC), filtrado
+ * por CODEMP IN ($codempList). Pressupoe CON_FIDC ja existente.
+ * Apos os SELECT INTO recria os indices das tabelas alvo (so faz sentido no modo SGH,
+ * porque no modo Cliente os nomes destino sao diferentes da origem).
+ */
+function reprocessarExcecoes($conn, string $modo, string $bdOrigem, string $bdDestino, string $codempList): bool
+{
+    logInfo("");
+    logInfo("========================================");
+    $rotulo = $modo === 'sgh' ? 'SGH: mttbse1 / mttbdep / mttbse2'
+                              : 'CLIENTE: ficha_socio_economica / DEPENDENTES_CLIENTE / CADASTRO_INSCRICOES';
+    logInfo("REPROCESSAR EXCECOES - $rotulo");
+    logInfo("========================================");
+
+    if ($codempList === '') {
+        logError("codempList vazio: nao e possivel filtrar excecoes por empresa.");
+        return false;
+    }
+
+    // Mapeamento de nomes destino por modo
+    if ($modo === 'sgh') {
+        $tabSE1 = 'mttbse1';
+        $tabDEP = 'mttbdep';
+        $tabSE2 = 'mttbse2';
+        // SELECT s.* (mesma estrutura da origem)
+        $colsSE1 = 's.*';
+    } else { // 'cliente'
+        $tabSE1 = 'ficha_socio_economica';
+        $tabDEP = 'DEPENDENTES_CLIENTE';
+        $tabSE2 = 'CADASTRO_INSCRICOES';
+        // Lista de colunas selecionadas (mesma do sql_scripts.php Phase 5)
+        $colsSE1 = "s.CODEMP, s.CGCCPF, s.FISJUR, s.NOMTIT, s.END_TITC, s.CPL_ENDC,
+                    s.BAIRROC, s.CIDADEC, s.ESTADOC, s.COD_CEPC, s.CPL_CEPC, s.CXA_POSC,
+                    s.DDD_TELC, s.NUM_TELC, s.RAM_TELC, s.DDD_FAXC, s.NUM_FAXC,
+                    s.CODNAC, s.CODNAT, s.CODSEX, s.ESTCIV, s.REGCAS, s.DTANAS, s.ATVPRO,
+                    s.NUMIDT, s.ORGIDT, s.ESTIDT, s.FXA_REND, s.CNJNOM, s.CNJCPF,
+                    s.CODUSR, s.DTAIMP, s.DTAMOV, s.EMISS_CONJUG, s.CODAGENTE, s.EMAIL,
+                    s.PIS, s.PIS_CONJ, s.CONS_ORGAO, s.CONS_SETOR, s.CONS_MUNIC, s.CONS_MATR,
+                    s.LCOB_BANCO, s.LCOB_AGENCIA, s.LCOB_CONTA, s.LCOB_TIPO_CC";
+    }
+
+    // 1) Apagar destino + temps
+    logInfo("Apagando tabelas de excecao existentes (se houver)...");
+    dropIfExists($conn, "[$bdDestino].DBO.[$tabSE1]");
+    dropIfExists($conn, "[$bdDestino].DBO.[$tabDEP]");
+    dropIfExists($conn, "[$bdDestino].DBO.[$tabSE2]");
+    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cpf");
+    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cpf_final");
+    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cliente_unic");
+
+    // 2) Coletar CPFs filtrados por CODEMP
+    if (!excCriarTempCPF($conn, $bdOrigem, $bdDestino, $codempList)) {
+        return false;
+    }
+    $cntCpf = contarRegistros($conn, "[$bdDestino].DBO._exc_temp_cpf_final");
+    logSuccess("CPFs distintos coletados (CODEMP IN ($codempList)): $cntCpf");
+
+    // 3) Resolver CLIENTE_UNIC via mttbse2 filtrando por CODEMP
+    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._exc_temp_cliente_unic (cliente_unic BIGINT)",
+                     "EXC: criar _exc_temp_cliente_unic")) {
+        return false;
+    }
+    $sqlResolve = "INSERT INTO [$bdDestino].DBO._exc_temp_cliente_unic
+                   SELECT DISTINCT s.CLIENTE_UNIC
+                     FROM [$bdOrigem].DBO.mttbse2 s
+                    INNER JOIN [$bdDestino].DBO._exc_temp_cpf_final t ON t.cpf = s.CGC_CPF
+                    WHERE s.CODEMP IN ($codempList)
+                      AND s.CLIENTE_UNIC IS NOT NULL AND s.CLIENTE_UNIC <> 0";
+    if (!executarSQL($conn, $sqlResolve, "EXC: resolver CLIENTE_UNIC via mttbse2")) return false;
+    $cntCli = contarRegistros($conn, "[$bdDestino].DBO._exc_temp_cliente_unic");
+    logSuccess("CLIENTE_UNIC resolvidos: $cntCli");
+
+    // 4) SE1 (link por CPF)
+    $sqlSE1 = "SELECT $colsSE1
+                 INTO [$bdDestino].DBO.[$tabSE1]
+                 FROM [$bdOrigem].DBO.mttbse1 s
+                INNER JOIN [$bdDestino].DBO._exc_temp_cpf_final t ON t.cpf = s.CGCCPF
+                WHERE s.CODEMP IN ($codempList)";
+    if (!executarSQL($conn, $sqlSE1, "EXC: SELECT INTO $tabSE1 (por CPF)")) return false;
+    $cSE1 = contarRegistros($conn, "[$bdDestino].DBO.[$tabSE1]");
+    logSuccess("[OK] $tabSE1 - $cSE1 registros");
+
+    // 5) DEP (link por CLIENTE_UNIC)
+    $sqlDEP = "SELECT s.* INTO [$bdDestino].DBO.[$tabDEP]
+                 FROM [$bdOrigem].DBO.mttbdep s
+                INNER JOIN [$bdDestino].DBO._exc_temp_cliente_unic t ON t.cliente_unic = s.CLIENTE_UNIC
+                WHERE s.CODEMP IN ($codempList)";
+    if (!executarSQL($conn, $sqlDEP, "EXC: SELECT INTO $tabDEP (por CLIENTE_UNIC)")) return false;
+    $cDEP = contarRegistros($conn, "[$bdDestino].DBO.[$tabDEP]");
+    logSuccess("[OK] $tabDEP - $cDEP registros");
+
+    // 6) SE2 (link por CLIENTE_UNIC)
+    $sqlSE2 = "SELECT s.* INTO [$bdDestino].DBO.[$tabSE2]
+                 FROM [$bdOrigem].DBO.mttbse2 s
+                INNER JOIN [$bdDestino].DBO._exc_temp_cliente_unic t ON t.cliente_unic = s.CLIENTE_UNIC
+                WHERE s.CODEMP IN ($codempList)";
+    if (!executarSQL($conn, $sqlSE2, "EXC: SELECT INTO $tabSE2 (por CLIENTE_UNIC)")) return false;
+    $cSE2 = contarRegistros($conn, "[$bdDestino].DBO.[$tabSE2]");
+    logSuccess("[OK] $tabSE2 - $cSE2 registros");
+
+    // 7) Recriar indices das 3 tabelas (so faz sentido se nomes destino == origem, ou seja modo SGH)
+    if ($modo === 'sgh') {
+        logInfo("Recriando indices das 3 tabelas...");
+        excRecriarIndicesDeTabelas($conn, $bdOrigem, $bdDestino, [$tabSE1, $tabDEP, $tabSE2]);
+    } else {
+        logInfo("Modo Cliente: indices nao sao recriados (nomes destino diferem da origem).");
+    }
+
+    // 8) Limpeza
+    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cpf");
+    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cpf_final");
+    dropIfExists($conn, "[$bdDestino].DBO._exc_temp_cliente_unic");
+
+    return true;
+}
+
 // ===================== CALCULAR TOTAL DE STEPS =====================
 $totalSteps = 2; // criar banco + criar CON_FIDC
 
@@ -706,6 +991,26 @@ sendProgress($currentStep, $totalSteps, 'CON_FIDC populada');
 
 // ===================== BRANCHING: CLIENTE vs SGH =====================
 if ($tipo === 'cliente') {
+
+// ===================== MODO: REPROCESSAR APENAS EXCECOES =====================
+if ($onlyExceptions) {
+    $okExc = reprocessarExcecoes($conn, 'cliente', $bdOrigem, $bdDestino, $codempList);
+    if ($okExc) {
+        sendProgress($totalSteps, $totalSteps, 'Excecoes reprocessadas');
+        logSuccess("Reprocessamento de excecoes concluido com sucesso.");
+        sendEvent('done', [
+            'success'      => true,
+            'totalTabelas' => 3,
+            'banco'        => $bdDestino,
+            'hasReport'    => false,
+        ]);
+    } else {
+        logError("Falha ao reprocessar excecoes. Verifique o log acima.");
+        sendEvent('done', ['success' => false]);
+    }
+    sqlsrv_close($conn);
+    exit;
+}
 
 // ===================== FASE 1: TABELAS DE REFERENCIA =====================
 logInfo("");
@@ -998,247 +1303,6 @@ function sghCriarTempCodAdq($conn, string $bdOrigem, string $bdDestino): bool
     return executarSQL($conn, "INSERT INTO [$bdDestino].DBO._sgh_temp_codadq_final
                                 SELECT DISTINCT t.codadq FROM [$bdDestino].DBO._sgh_temp_codadq t
                                 WHERE t.codadq IS NOT NULL AND t.codadq <> 0", "SGH: distinct COD_ADQ");
-}
-
-/**
- * Variante de sghCriarTempCPF que restringe a coleta aos contratos
- * das empresas indicadas em $codempList. Usada pelo reprocessamento
- * de excecoes para evitar puxar CPFs de empresas que nao serao recriadas.
- */
-function sghCriarTempCPFFiltradoPorCodemp($conn, string $bdOrigem, string $bdDestino, string $codempList): bool
-{
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf");
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
-
-    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_cpf (cpf CHAR(14))", "SGH: criar _sgh_temp_cpf")) {
-        return false;
-    }
-
-    $camposCon = ['ADQ1_CPFCGC', 'ADQ2_CPF', 'ADQ3_CPF', 'ADQ4_CPF', 'DATU_CGC_CPF', 'DATU_AD2_CPF', 'DATU_AD3_CPF', 'DATU_AD4_CPF'];
-    $colsCon = getTableColumns($conn, $bdOrigem, 'mttbcon');
-    $totalCon = count(array_intersect($camposCon, $colsCon));
-    $i = 0;
-    foreach ($camposCon as $campo) {
-        if (!in_array($campo, $colsCon)) continue;
-        $i++;
-        logInfo("  CPF $i/$totalCon: coletando $campo de mttbcon (CODEMP IN ($codempList))...");
-        $sql = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf
-                SELECT DISTINCT c.[$campo] FROM [$bdOrigem].DBO.mttbcon c
-                WHERE c.[$campo] IS NOT NULL
-                  AND c.CODEMP IN ($codempList)
-                  AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
-                              WHERE X.CODEMP IN ($codempList)
-                                AND X.CODEMP = c.CODEMP AND X.REGIAO = c.REGIAO
-                                AND X.NUCLEO = c.NUCLEO AND X.CONTRATO = c.CONTRATO)";
-        executarSQL($conn, $sql, "SGH: coletar CPF $campo (mttbcon)");
-    }
-
-    $camposHis = ['AD1_CGCCPF', 'AD2_CPF', 'AD3_CPF', 'AD4_CPF'];
-    $colsHis = getTableColumns($conn, $bdOrigem, 'mttbhis');
-    if (!empty($colsHis)) {
-        $totalHis = count(array_intersect($camposHis, $colsHis));
-        $j = 0;
-        foreach ($camposHis as $campo) {
-            if (!in_array($campo, $colsHis)) continue;
-            $j++;
-            logInfo("  CPF $j/$totalHis: coletando $campo de mttbhis (CODEMP IN ($codempList))...");
-            $sql = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf
-                    SELECT DISTINCT h.[$campo] FROM [$bdOrigem].DBO.mttbhis h
-                    WHERE h.[$campo] IS NOT NULL
-                      AND h.CODEMP IN ($codempList)
-                      AND EXISTS (SELECT 1 FROM [$bdDestino].DBO.CON_FIDC X
-                                  WHERE X.CODEMP IN ($codempList)
-                                    AND X.CODEMP = h.CODEMP AND X.REGIAO = h.REGIAO
-                                    AND X.NUCLEO = h.NUCLEO AND X.CONTRATO = h.CONTRATO)";
-            executarSQL($conn, $sql, "SGH: coletar CPF $campo (mttbhis)");
-        }
-    }
-
-    logInfo("  CPF: normalizando para CHAR(14)...");
-    executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_cpf_final (cpf CHAR(14))", "SGH: criar _sgh_temp_cpf_final");
-    $sqlNorm = "INSERT INTO [$bdDestino].DBO._sgh_temp_cpf_final
-                SELECT DISTINCT RIGHT('00000000000000' + LTRIM(RTRIM(t.cpf)), 14)
-                FROM [$bdDestino].DBO._sgh_temp_cpf t
-                WHERE t.cpf IS NOT NULL AND LTRIM(RTRIM(t.cpf)) <> ''";
-    return executarSQL($conn, $sqlNorm, "SGH: normalizar CPFs");
-}
-
-/**
- * Reprocessa apenas as 3 tabelas de excecao (mttbse1, mttbdep, mttbse2)
- * no modo SGH, apagando e recriando-as no banco destino.
- * Resolve CLIENTE_UNIC via mttbse2.CGC_CPF -> CLIENTE_UNIC (sem depender
- * de COD_ADQ_PRIN/COD_COADQ* em mttbcon, que nem todo schema possui).
- * Pressupoe que [DEST].DBO.CON_FIDC ja existe e esta populada.
- */
-function sghReprocessarExcecoes($conn, string $bdOrigem, string $bdDestino, string $codempList): bool
-{
-    logInfo("");
-    logInfo("========================================");
-    logInfo("SGH: REPROCESSAR EXCECOES - mttbse1 / mttbdep / mttbse2");
-    logInfo("========================================");
-
-    if ($codempList === '') {
-        logError("codempList vazio: nao e possivel filtrar excecoes por empresa.");
-        return false;
-    }
-
-    // 1) Apagar as 3 tabelas e quaisquer temps remanescentes
-    logInfo("Apagando tabelas de excecao existentes (se houver)...");
-    dropIfExists($conn, "[$bdDestino].DBO.mttbse1");
-    dropIfExists($conn, "[$bdDestino].DBO.mttbdep");
-    dropIfExists($conn, "[$bdDestino].DBO.mttbse2");
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf");
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
-    dropIfExists($conn, "[$bdDestino].DBO._sgh_temp_cliente_unic");
-
-    // 2) Coletar CPFs filtrados pelos contratos das empresas-alvo
-    if (!sghCriarTempCPFFiltradoPorCodemp($conn, $bdOrigem, $bdDestino, $codempList)) {
-        return false;
-    }
-    $cntCpf = contarRegistros($conn, "[$bdDestino].DBO._sgh_temp_cpf_final");
-    logSuccess("CPFs distintos coletados (apenas CODEMP IN ($codempList)): $cntCpf");
-
-    // 3) Resolver CLIENTE_UNIC via mttbse2 (CGC_CPF + CLIENTE_UNIC), restrito a CODEMP alvo
-    if (!executarSQL($conn, "CREATE TABLE [$bdDestino].DBO._sgh_temp_cliente_unic (cliente_unic BIGINT)",
-                     "SGH: criar _sgh_temp_cliente_unic")) {
-        return false;
-    }
-    $sqlResolve = "INSERT INTO [$bdDestino].DBO._sgh_temp_cliente_unic
-                   SELECT DISTINCT s.CLIENTE_UNIC
-                     FROM [$bdOrigem].DBO.mttbse2 s
-                    INNER JOIN [$bdDestino].DBO._sgh_temp_cpf_final t ON t.cpf = s.CGC_CPF
-                    WHERE s.CODEMP IN ($codempList)
-                      AND s.CLIENTE_UNIC IS NOT NULL AND s.CLIENTE_UNIC <> 0";
-    if (!executarSQL($conn, $sqlResolve, "SGH: resolver CLIENTE_UNIC via mttbse2")) return false;
-    $cntCli = contarRegistros($conn, "[$bdDestino].DBO._sgh_temp_cliente_unic");
-    logSuccess("CLIENTE_UNIC resolvidos: $cntCli");
-
-    // 4) mttbse1 (link por CPF)
-    $sqlSE1 = "SELECT s.* INTO [$bdDestino].DBO.mttbse1
-                 FROM [$bdOrigem].DBO.mttbse1 s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_cpf_final t ON t.cpf = s.CGCCPF
-                WHERE s.CODEMP IN ($codempList)";
-    if (!executarSQL($conn, $sqlSE1, "SGH: SELECT INTO mttbse1 (por CPF)")) return false;
-    $cSE1 = contarRegistros($conn, "[$bdDestino].DBO.mttbse1");
-    logSuccess("[OK] mttbse1 - $cSE1 registros");
-
-    // 5) mttbdep (link por CLIENTE_UNIC)
-    $sqlDEP = "SELECT s.* INTO [$bdDestino].DBO.mttbdep
-                 FROM [$bdOrigem].DBO.mttbdep s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_cliente_unic t ON t.cliente_unic = s.CLIENTE_UNIC
-                WHERE s.CODEMP IN ($codempList)";
-    if (!executarSQL($conn, $sqlDEP, "SGH: SELECT INTO mttbdep (por CLIENTE_UNIC)")) return false;
-    $cDEP = contarRegistros($conn, "[$bdDestino].DBO.mttbdep");
-    logSuccess("[OK] mttbdep - $cDEP registros");
-
-    // 6) mttbse2 (link por CLIENTE_UNIC)
-    $sqlSE2 = "SELECT s.* INTO [$bdDestino].DBO.mttbse2
-                 FROM [$bdOrigem].DBO.mttbse2 s
-                INNER JOIN [$bdDestino].DBO._sgh_temp_cliente_unic t ON t.cliente_unic = s.CLIENTE_UNIC
-                WHERE s.CODEMP IN ($codempList)";
-    if (!executarSQL($conn, $sqlSE2, "SGH: SELECT INTO mttbse2 (por CLIENTE_UNIC)")) return false;
-    $cSE2 = contarRegistros($conn, "[$bdDestino].DBO.mttbse2");
-    logSuccess("[OK] mttbse2 - $cSE2 registros");
-
-    // 7) Recriar indices nas 3 tabelas (SELECT INTO nao copia indices)
-    logInfo("Recriando indices das 3 tabelas...");
-    sghRecriarIndicesDeTabelas($conn, $bdOrigem, $bdDestino, ['mttbse1', 'mttbdep', 'mttbse2']);
-
-    // 8) DIAGNOSTICO: manter as temps no banco destino para inspecao
-    //    (em vez de dropar). Permite consultar:
-    //      SELECT * FROM [DEST].DBO._sgh_temp_cpf;          -- antes da normalizacao
-    //      SELECT * FROM [DEST].DBO._sgh_temp_cpf_final;    -- apos normalizacao
-    //      SELECT * FROM [DEST].DBO._sgh_temp_cliente_unic; -- resolvidos via mttbse2
-    $cntCpfBruto = contarRegistros($conn, "[$bdDestino].DBO._sgh_temp_cpf");
-    $cntCpfDistBruto = contarRegistros($conn, "(SELECT DISTINCT cpf FROM [$bdDestino].DBO._sgh_temp_cpf) X");
-    logInfo("Diagnostico _sgh_temp_cpf: $cntCpfBruto linhas totais, $cntCpfDistBruto CPFs distintos (pre-normalizacao).");
-    logWarn("Temps _sgh_temp_cpf, _sgh_temp_cpf_final e _sgh_temp_cliente_unic mantidas no destino para inspecao.");
-
-    return true;
-}
-
-/**
- * Recria os indices nao-clusterizados (e nao-PK/UQ) de uma lista de tabelas,
- * lendo a definicao da sys.indexes do banco origem. Usado pelo reprocessamento
- * de excecoes apos SELECT INTO (que nao herda indices).
- */
-function sghRecriarIndicesDeTabelas($conn, string $bdOrigem, string $bdDestino, array $tabelas): void
-{
-    if (empty($tabelas)) return;
-    $inList = "'" . implode("','", array_map(fn($t) => strtolower($t), $tabelas)) . "'";
-
-    $sqlIdx = "
-    SELECT
-        t.name AS tabela,
-        i.name AS idx_nome,
-        i.is_unique,
-        i.type_desc,
-        i.filter_definition,
-        STUFF((
-            SELECT ',[' + c.name + ']' + CASE WHEN ic.is_descending_key = 1 THEN ' DESC' ELSE '' END
-            FROM [$bdOrigem].sys.index_columns ic
-            INNER JOIN [$bdOrigem].sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
-            ORDER BY ic.key_ordinal
-            FOR XML PATH('')
-        ), 1, 1, '') AS colunas_chave,
-        STUFF((
-            SELECT ',[' + c.name + ']'
-            FROM [$bdOrigem].sys.index_columns ic
-            INNER JOIN [$bdOrigem].sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1
-            ORDER BY ic.index_column_id
-            FOR XML PATH('')
-        ), 1, 1, '') AS colunas_include
-    FROM [$bdOrigem].sys.indexes i
-    INNER JOIN [$bdOrigem].sys.tables t ON i.object_id = t.object_id
-    WHERE i.type IN (1,2)
-      AND i.is_primary_key = 0
-      AND i.is_unique_constraint = 0
-      AND i.name IS NOT NULL
-      AND LOWER(t.name) IN ($inList)
-    ORDER BY t.name, i.name
-    ";
-    $stmt = sqlsrv_query($conn, $sqlIdx);
-    if (!$stmt) {
-        logWarn("Nao foi possivel listar indices da origem para as tabelas alvo.");
-        return;
-    }
-    $idxOk = 0;
-    $idxErro = 0;
-    while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
-        $tab = $row['tabela'];
-        $nomeIdx = $row['idx_nome'];
-        if (empty($row['colunas_chave'])) continue;
-        $unique = $row['is_unique'] ? 'UNIQUE ' : '';
-        $clustered = (strpos($row['type_desc'], 'CLUSTERED') !== false && strpos($row['type_desc'], 'NONCLUSTERED') === false) ? 'CLUSTERED ' : 'NONCLUSTERED ';
-        $colsKey = $row['colunas_chave'];
-        $colsInc = $row['colunas_include'] ?? '';
-        $filterDef = $row['filter_definition'] ?? '';
-        $includeClause = !empty($colsInc) ? " INCLUDE ($colsInc)" : '';
-        $whereClause   = !empty($filterDef) ? " WHERE $filterDef" : '';
-
-        $sqlCreate = "IF NOT EXISTS (SELECT 1 FROM [$bdDestino].sys.indexes
-                                     WHERE name = '$nomeIdx'
-                                       AND object_id = OBJECT_ID('[$bdDestino].DBO.[$tab]'))
-                      CREATE {$unique}{$clustered}INDEX [$nomeIdx] ON [$bdDestino].DBO.[$tab] ($colsKey){$includeClause}{$whereClause}";
-
-        $stmtCreate = sqlsrv_query($conn, $sqlCreate, [], ['QueryTimeout' => 0]);
-        if ($stmtCreate === false) {
-            $errs = sqlsrv_errors();
-            $msg = $errs ? trim($errs[0]['message']) : 'erro desconhecido';
-            $msg = preg_replace('/^\[[^\]]+\]\s*\[[^\]]+\]\s*\[[^\]]+\]\s*/', '', $msg);
-            logWarn("  [FALHA] Indice $nomeIdx em $tab: $msg");
-            $idxErro++;
-        } else {
-            while (sqlsrv_next_result($stmtCreate)) {}
-            sqlsrv_free_stmt($stmtCreate);
-            logInfo("  [OK] Indice $nomeIdx em $tab");
-            $idxOk++;
-        }
-    }
-    sqlsrv_free_stmt($stmt);
-    logSuccess("Indices recriados: $idxOk OK / $idxErro falhas");
 }
 
 /**
@@ -1797,7 +1861,7 @@ $countPulou = 0;
 $countEspecial = 0;
 
 if ($onlyExceptions) {
-    $okExc = sghReprocessarExcecoes($conn, $bdOrigem, $bdDestino, $codempList);
+    $okExc = reprocessarExcecoes($conn, 'sgh', $bdOrigem, $bdDestino, $codempList);
     if ($okExc) {
         sendProgress($totalSteps, $totalSteps, 'Excecoes reprocessadas');
         logSuccess("Reprocessamento de excecoes concluido com sucesso.");
