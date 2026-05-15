@@ -843,6 +843,16 @@ if ($onlyFinalizers || $onlyExceptions) {
             }
             logSuccess("Modo $rotuloModo: restringindo a CODEMP(s) do formulario: " . implode(',', $codemps));
         } else {
+            // Form vazio: so deixa passar se CON_FIDC tiver uma unica empresa.
+            // Se tiver mais de uma, abortamos para evitar processar empresas que
+            // o usuario nao queria juntar no mesmo reprocessamento.
+            if ($onlyExceptions && count($codempsCon) > 1) {
+                logError("CON_FIDC contem multiplas empresas: " . implode(',', $codempsCon) . ".");
+                logError(">>> Preencha o campo CODEMP no formulario com a(s) empresa(s) que deseja reprocessar.");
+                logError(">>> Exemplos validos: \"11\"  ou  \"5,11\"  (uma ou varias separadas por virgula)");
+                sendEvent('done', ['success' => false]);
+                exit;
+            }
             $codemps = $codempsCon;
             logSuccess("Modo $rotuloModo: $bdDestino existe, codemps em CON_FIDC: " . implode(',', $codemps));
         }
