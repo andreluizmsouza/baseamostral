@@ -610,6 +610,24 @@
         // Carregar no inicio
         carregarCampos();
 
+        // ========== MUTUA EXCLUSAO ENTRE FLAGS DE MODO ==========
+        // Apagar/Retomada/Excecoes sao incompativeis entre si: marcar um desmarca os outros.
+        (function setupMutexFlags() {
+            var mutex = ['chkDropDB', 'chkOnlyFinalizers', 'chkOnlyExceptions'];
+            mutex.forEach(function (id) {
+                var el = document.getElementById(id);
+                if (!el) return;
+                el.addEventListener('change', function () {
+                    if (!el.checked) return;
+                    mutex.forEach(function (otherId) {
+                        if (otherId === id) return;
+                        var other = document.getElementById(otherId);
+                        if (other && other.checked) other.checked = false;
+                    });
+                });
+            });
+        })();
+
         function setTipo(tipo) {
             document.getElementById('tipoInput').value = tipo;
             document.querySelectorAll('[data-tipo]').forEach(function(b) {
@@ -655,11 +673,6 @@
 
             if (!isRetomada && !isOnlyExc && (!fileInput.files || fileInput.files.length === 0)) {
                 alert('Selecione o arquivo TXT de contratos.');
-                return;
-            }
-
-            if (isOnlyExc && isRetomada) {
-                alert('Modo "Reprocessar exceções" e "Modo retomada" não podem ser usados juntos.');
                 return;
             }
 
