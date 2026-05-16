@@ -611,16 +611,21 @@
         carregarCampos();
 
         // ========== MUTUA EXCLUSAO ENTRE FLAGS DE MODO ==========
-        // Apagar/Retomada/Excecoes sao incompativeis entre si: marcar um desmarca os outros.
+        // Apagar/Retomada/Excecoes/SkipBlobs tem combinacoes invalidas.
+        // Mapa: marcar a flag-chave desmarca as flags listadas como incompativeis.
         (function setupMutexFlags() {
-            var mutex = ['chkDropDB', 'chkOnlyFinalizers', 'chkOnlyExceptions'];
-            mutex.forEach(function (id) {
+            var incompat = {
+                chkDropDB:          ['chkOnlyFinalizers', 'chkOnlyExceptions'],
+                chkOnlyFinalizers:  ['chkDropDB', 'chkOnlyExceptions', 'chkSkipBlobs'],
+                chkOnlyExceptions:  ['chkDropDB', 'chkOnlyFinalizers', 'chkSkipBlobs'],
+                chkSkipBlobs:       ['chkOnlyFinalizers', 'chkOnlyExceptions']
+            };
+            Object.keys(incompat).forEach(function (id) {
                 var el = document.getElementById(id);
                 if (!el) return;
                 el.addEventListener('change', function () {
                     if (!el.checked) return;
-                    mutex.forEach(function (otherId) {
-                        if (otherId === id) return;
+                    incompat[id].forEach(function (otherId) {
                         var other = document.getElementById(otherId);
                         if (other && other.checked) other.checked = false;
                     });
